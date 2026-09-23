@@ -131,13 +131,15 @@ Return:
 
 
 def write_email(*, company: str, signal_name: str, evidence_text: str,
-                pain_summary: str, ai_reason: str, config: dict) -> tuple[str, str] | None:
+                pain_summary: str, ai_reason: str, contact_name: str = "",
+                contact_title: str = "", config: dict) -> tuple[str, str] | None:
     client, model = _client_and_model(config)
     if client is None:
         return None
 
     offer = config.get("offer", {})
     max_words = int(config.get("ai", {}).get("max_email_words", 90))
+    greeting = f"Hi {contact_name.split()[0]}," if contact_name.strip() else "Hi,"
 
     prompt = f"""
 Write a concise, human B2B cold email based ONLY on the evidence below.
@@ -154,9 +156,12 @@ Rules:
 - Keep the BODY under {max_words} words, excluding signature/opt-out.
 - Do not add an opt-out sentence; the sending layer handles it.
 - Subject should be 2-6 words and not clickbait.
+- Address the named contact only if one is supplied below. Never invent a name.
 
 PROSPECT
 Company: {company}
+Contact: {contact_name or 'Unknown'}
+Contact title: {contact_title or 'Unknown'}
 Signal: {signal_name}
 Evidence: {evidence_text[:3500]}
 Validated pain: {pain_summary}
@@ -169,7 +174,7 @@ CTA preference: {offer.get('cta', 'Open to a quick chat?')}
 Sender name: {offer.get('sender_name', '')}
 
 Write as a competent operator, not a marketing copywriter.
-Return subject and body. The body should begin with "Hi," and end with the sender name.
+Return subject and body. The body must begin exactly with "{greeting}" and end with the sender name.
 """
 
     try:
