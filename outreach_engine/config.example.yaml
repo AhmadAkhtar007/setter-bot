@@ -26,8 +26,15 @@ signals:
     score: 15
 
 qualification:
-  min_score: 35
+  min_score: 50
   require_public_email: true
+
+ai:
+  enabled: true
+  model: gemini-3.5-flash-lite
+  min_heuristic_score_before_ai: 15
+  min_confidence: 55
+  max_email_words: 90
 
 outreach:
   send_mode: draft
