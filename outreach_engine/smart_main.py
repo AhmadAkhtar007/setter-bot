@@ -122,7 +122,7 @@ def discover(conn: sqlite3.Connection, config: dict) -> None:
     created = 0
 
     if not use_ai:
-        print("[ai] GEMINI_API_KEY not configured; using heuristic qualification fallback.")
+        print("[ai] No configured LLM provider key found; using heuristic qualification fallback.")
 
     for i, candidate in enumerate(candidates, 1):
         candidate, research_text = smart_research(candidate, config)
