@@ -11,20 +11,27 @@ from bs4 import BeautifulSoup
 import main as core
 from ai_agent import available as ai_available
 from ai_agent import qualify_lead, write_email
+from contact_agent import find_best_contact
 
 
-AI_COLUMNS = {
+EXTRA_COLUMNS = {
     "research_text": "TEXT",
     "pain_summary": "TEXT",
     "ai_reason": "TEXT",
     "ai_confidence": "INTEGER DEFAULT 0",
     "ai_evidence_quote": "TEXT",
+    "contact_name": "TEXT",
+    "contact_title": "TEXT",
+    "contact_source_url": "TEXT",
+    "contact_source_text": "TEXT",
+    "contact_confidence": "INTEGER DEFAULT 0",
+    "email_mx_valid": "INTEGER DEFAULT 0",
 }
 
 
-def ensure_ai_columns(conn: sqlite3.Connection) -> None:
+def ensure_extra_columns(conn: sqlite3.Connection) -> None:
     existing = {row[1] for row in conn.execute("PRAGMA table_info(leads)").fetchall()}
-    for name, sql_type in AI_COLUMNS.items():
+    for name, sql_type in EXTRA_COLUMNS.items():
         if name not in existing:
             conn.execute(f"ALTER TABLE leads ADD COLUMN {name} {sql_type}")
     conn.commit()
@@ -35,7 +42,7 @@ def smart_research(candidate: core.Candidate, config: dict) -> tuple[core.Candid
     timeout = int(crawler.get("timeout_seconds", 12))
     max_pages = int(crawler.get("max_pages_per_domain", 5))
     ua = crawler.get("user_agent", "Mozilla/5.0")
-    pages = ["/", "/contact", "/contact-us", "/about", "/careers", "/jobs"][:max_pages]
+    pages = ["/", "/contact", "/contact-us", "/about", "/team", "/leadership", "/careers", "/jobs"][:max_pages]
     texts: list[str] = []
     emails: list[str] = []
 
@@ -67,30 +74,41 @@ def smart_research(candidate: core.Candidate, config: dict) -> tuple[core.Candid
     return candidate, research_text
 
 
-def save_ai_result(conn: sqlite3.Connection, candidate: core.Candidate, research_text: str, result) -> None:
+def save_enrichment(conn: sqlite3.Connection, candidate: core.Candidate, research_text: str,
+                    ai_result=None, contact=None) -> None:
     fp = core.fingerprint(candidate.company, candidate.website, candidate.email)
-    conn.execute(
-        """UPDATE leads
-           SET research_text=?, pain_summary=?, ai_reason=?, ai_confidence=?, ai_evidence_quote=?, score=?, updated_at=?
-           WHERE fingerprint=?""",
-        (
-            research_text,
-            result.pain_summary,
-            result.reason,
-            result.confidence,
-            result.evidence_quote,
-            result.score,
-            core.now_iso(),
-            fp,
-        ),
-    )
+    fields = {
+        "research_text": research_text,
+        "updated_at": core.now_iso(),
+    }
+    if ai_result:
+        fields.update({
+            "pain_summary": ai_result.pain_summary,
+            "ai_reason": ai_result.reason,
+            "ai_confidence": ai_result.confidence,
+            "ai_evidence_quote": ai_result.evidence_quote,
+            "score": ai_result.score,
+        })
+    if contact:
+        fields.update({
+            "contact_name": contact.name,
+            "contact_title": contact.title,
+            "contact_source_url": contact.source_url,
+            "contact_source_text": contact.source_text,
+            "contact_confidence": contact.confidence,
+            "email_mx_valid": 1 if contact.mx_valid else 0,
+        })
+
+    assignments = ", ".join(f"{key}=?" for key in fields)
+    values = list(fields.values()) + [fp]
+    conn.execute(f"UPDATE leads SET {assignments} WHERE fingerprint=?", values)
     conn.commit()
 
 
 def discover(conn: sqlite3.Connection, config: dict) -> None:
-    ensure_ai_columns(conn)
+    ensure_extra_columns(conn)
     candidates = core.search_candidates(config)
-    print(f"Search produced {len(candidates)} candidate result(s). Researching + qualifying...")
+    print(f"Search produced {len(candidates)} candidate result(s). Researching + contact-enriching + qualifying...")
 
     qualification = config.get("qualification", {})
     ai_cfg = config.get("ai", {})
@@ -102,19 +120,31 @@ def discover(conn: sqlite3.Connection, config: dict) -> None:
     created = 0
 
     if not use_ai:
-        print("[ai] GEMINI_API_KEY not configured; using heuristic fallback.")
+        print("[ai] GEMINI_API_KEY not configured; using heuristic qualification fallback.")
 
     for i, candidate in enumerate(candidates, 1):
         candidate, research_text = smart_research(candidate, config)
-
-        if require_email and not candidate.email:
-            continue
         if candidate.score < min_heuristic:
             continue
 
-        result = None
+        contact = find_best_contact(
+            company=candidate.company,
+            website=candidate.website,
+            research_text=research_text,
+            existing_email=candidate.email,
+            config=config,
+        )
+        if contact:
+            candidate.email = contact.email
+            who = f"{contact.name} ({contact.title})" if contact.name else "business inbox"
+            print(f"[contact] {candidate.company}: {who} <{contact.email}> conf={contact.confidence} MX={contact.mx_valid}")
+        elif require_email:
+            print(f"[contact-reject] {candidate.company}: no sufficiently supported public business email")
+            continue
+
+        ai_result = None
         if use_ai:
-            result = qualify_lead(
+            ai_result = qualify_lead(
                 company=candidate.company,
                 website=candidate.website,
                 signal_name=candidate.signal_name,
@@ -124,21 +154,24 @@ def discover(conn: sqlite3.Connection, config: dict) -> None:
                 research_text=research_text,
                 config=config,
             )
-            if result:
-                candidate.score = result.score
-                if not result.qualified or result.confidence < min_confidence or result.score < min_score:
-                    print(f"[reject] {candidate.company} score={result.score} confidence={result.confidence}: {result.reason}")
+            if ai_result:
+                candidate.score = ai_result.score
+                if not ai_result.qualified or ai_result.confidence < min_confidence or ai_result.score < min_score:
+                    print(
+                        f"[reject] {candidate.company} score={ai_result.score} "
+                        f"confidence={ai_result.confidence}: {ai_result.reason}"
+                    )
                     continue
         elif candidate.score < min_score:
             continue
 
         if core.save_candidate(conn, candidate):
             created += 1
-            if result:
-                save_ai_result(conn, candidate, research_text, result)
+            save_enrichment(conn, candidate, research_text, ai_result=ai_result, contact=contact)
+            if ai_result:
                 print(
                     f"[{created}] {candidate.company} | {candidate.email or '-'} | "
-                    f"AI={result.score}/100 conf={result.confidence}% | {result.pain_summary}"
+                    f"AI={ai_result.score}/100 conf={ai_result.confidence}% | {ai_result.pain_summary}"
                 )
             else:
                 print(f"[{created}] {candidate.company} | {candidate.email or '-'} | heuristic={candidate.score}")
@@ -158,6 +191,8 @@ def personalized_email(row: sqlite3.Row, config: dict) -> tuple[str, str]:
             evidence_text=row["evidence_text"] or "",
             pain_summary=row["pain_summary"] or "",
             ai_reason=row["ai_reason"] or "",
+            contact_name=row["contact_name"] or "",
+            contact_title=row["contact_title"] or "",
             config=config,
         )
 
@@ -165,6 +200,9 @@ def personalized_email(row: sqlite3.Row, config: dict) -> tuple[str, str]:
         subject, body = result
     else:
         subject, body = core.deterministic_email(row, config)
+        if row["contact_name"]:
+            first = row["contact_name"].split()[0]
+            body = body.replace("Hi,", f"Hi {first},", 1)
 
     if config.get("outreach", {}).get("include_opt_out", True):
         opt_out = "P.S. If this isn't relevant, reply 'no' and I won't follow up."
@@ -174,11 +212,12 @@ def personalized_email(row: sqlite3.Row, config: dict) -> tuple[str, str]:
 
 
 def outreach(conn: sqlite3.Connection, config: dict) -> None:
-    ensure_ai_columns(conn)
+    ensure_extra_columns(conn)
     conn.row_factory = sqlite3.Row
     qualification = config.get("qualification", {})
     min_score = int(qualification.get("min_score", 50))
     require_email = bool(qualification.get("require_public_email", True))
+    min_contact_conf = int(config.get("contact_intelligence", {}).get("min_confidence", 45))
     cap = int(config.get("outreach", {}).get("daily_cap", 25))
     mode = config.get("outreach", {}).get("send_mode", "draft").lower()
     if mode not in {"draft", "send"}:
@@ -187,7 +226,7 @@ def outreach(conn: sqlite3.Connection, config: dict) -> None:
     rows = conn.execute(
         """SELECT * FROM leads
            WHERE status='discovered' AND score >= ?
-           ORDER BY score DESC, ai_confidence DESC, created_at ASC LIMIT ?""",
+           ORDER BY score DESC, ai_confidence DESC, contact_confidence DESC, created_at ASC LIMIT ?""",
         (min_score, cap),
     ).fetchall()
 
@@ -201,6 +240,8 @@ def outreach(conn: sqlite3.Connection, config: dict) -> None:
         if require_email and not row["email"]:
             continue
         if not row["email"]:
+            continue
+        if row["contact_confidence"] and row["contact_confidence"] < min_contact_conf:
             continue
         if conn.execute("SELECT 1 FROM suppressions WHERE email=?", (row["email"],)).fetchone():
             continue
@@ -221,26 +262,31 @@ def outreach(conn: sqlite3.Connection, config: dict) -> None:
         )
         conn.commit()
         count += 1
-        print(f"[{status}] {row['company']} <{row['email']}> score={row['score']}")
+        target = row["contact_name"] or row["email"]
+        print(f"[{status}] {row['company']} -> {target} <{row['email']}> score={row['score']}")
         time.sleep(0.4)
 
     print(f"Completed: {count} {mode}(s).")
 
 
 def stats(conn: sqlite3.Connection) -> None:
-    ensure_ai_columns(conn)
+    ensure_extra_columns(conn)
     conn.row_factory = sqlite3.Row
     rows = conn.execute("SELECT status, COUNT(*) AS n FROM leads GROUP BY status ORDER BY status").fetchall()
     print(f"Total leads: {sum(r['n'] for r in rows)}")
     for row in rows:
         print(f"  {row['status']}: {row['n']}")
     ai_count = conn.execute("SELECT COUNT(*) FROM leads WHERE ai_reason IS NOT NULL AND ai_reason != ''").fetchone()[0]
+    named_count = conn.execute("SELECT COUNT(*) FROM leads WHERE contact_name IS NOT NULL AND contact_name != ''").fetchone()[0]
+    mx_count = conn.execute("SELECT COUNT(*) FROM leads WHERE email_mx_valid=1").fetchone()[0]
     print(f"AI-qualified: {ai_count}")
+    print(f"Named decision-makers: {named_count}")
+    print(f"MX-valid emails: {mx_count}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="AI-qualified intent-first outreach engine")
-    parser.add_argument("--discover", action="store_true", help="Find, research and AI-qualify prospects")
+    parser.add_argument("--discover", action="store_true", help="Find, research, contact-enrich and qualify prospects")
     parser.add_argument("--outreach", action="store_true", help="Create drafts or send qualified outreach")
     parser.add_argument("--all", action="store_true", help="Run discovery then outreach")
     parser.add_argument("--gmail-auth", action="store_true")
@@ -249,7 +295,7 @@ def main() -> None:
 
     config = core.load_config()
     conn = core.init_db()
-    ensure_ai_columns(conn)
+    ensure_extra_columns(conn)
 
     if args.gmail_auth:
         core.gmail_service()
