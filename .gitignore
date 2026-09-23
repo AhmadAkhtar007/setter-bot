@@ -2,6 +2,15 @@
 .mcp.json
 .env
 
+# Outreach engine local secrets/data
+outreach_engine/.env
+outreach_engine/credentials.json
+outreach_engine/token.json
+outreach_engine/config.yaml
+outreach_engine/leads.db
+outreach_engine/.venv/
+outreach_engine/__pycache__/
+
 # Fathom MCP (cloned dependency, has its own .git)
 tools/fathom-mcp/
 
