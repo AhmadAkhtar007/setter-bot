@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
-from pydantic import BaseModel, Field
+from openai import OpenAI
+from pydantic import BaseModel, Field, ValidationError
 
 ROOT = Path(__file__).resolve().parent
 
@@ -36,33 +36,146 @@ class AgentResult:
     evidence_quote: str
 
 
-def _client_and_model(config: dict):
+PROVIDERS = {
+    "nvidia": {
+        "key_env": "NVIDIA_API_KEY",
+        "model_env": "NVIDIA_MODEL",
+        "default_model": "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+        "base_url": "https://integrate.api.nvidia.com/v1",
+    },
+    "openrouter": {
+        "key_env": "OPENROUTER_API_KEY",
+        "model_env": "OPENROUTER_MODEL",
+        "default_model": "openrouter/free",
+        "base_url": "https://openrouter.ai/api/v1",
+    },
+    "gemini": {
+        "key_env": "GEMINI_API_KEY",
+        "model_env": "GEMINI_MODEL",
+        "default_model": "gemini-3.8-flash",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+    },
+}
+
+DEFAULT_PROVIDER_ORDER = ["nvidia", "openrouter", "gemini"]
+
+
+def _load_env() -> None:
     load_dotenv(ROOT / ".env")
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        return None, None
-    model = (
-        config.get("ai", {}).get("model")
-        or os.getenv("GEMINI_MODEL")
-        or "gemini-3.5-flash-lite"
-    )
-    return genai.Client(api_key=api_key), model
+
+
+def _provider_order(config: dict) -> list[str]:
+    configured = config.get("ai", {}).get("provider_order", DEFAULT_PROVIDER_ORDER)
+    if isinstance(configured, str):
+        configured = [p.strip() for p in configured.split(",") if p.strip()]
+    return [p.lower() for p in configured if p.lower() in PROVIDERS]
+
+
+def _provider_ready(name: str) -> bool:
+    spec = PROVIDERS[name]
+    return bool(os.getenv(spec["key_env"], "").strip())
 
 
 def available(config: dict) -> bool:
     if not config.get("ai", {}).get("enabled", True):
         return False
-    client, _ = _client_and_model(config)
-    return client is not None
+    _load_env()
+    return any(_provider_ready(name) for name in _provider_order(config))
+
+
+def _client_for(name: str) -> tuple[OpenAI, str]:
+    spec = PROVIDERS[name]
+    api_key = os.getenv(spec["key_env"], "").strip()
+    if not api_key:
+        raise RuntimeError(f"{spec['key_env']} is not configured")
+
+    model = os.getenv(spec["model_env"], "").strip() or spec["default_model"]
+    kwargs = {
+        "api_key": api_key,
+        "base_url": spec["base_url"],
+        "timeout": 45.0,
+        "max_retries": 1,
+    }
+
+    if name == "openrouter":
+        headers = {
+            "X-Title": os.getenv("OPENROUTER_APP_NAME", "Outreach Engine"),
+        }
+        app_url = os.getenv("OPENROUTER_APP_URL", "").strip()
+        if app_url:
+            headers["HTTP-Referer"] = app_url
+        kwargs["default_headers"] = headers
+
+    return OpenAI(**kwargs), model
+
+
+def _extract_json(text: str) -> dict:
+    text = (text or "").strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    try:
+        value = json.loads(text)
+        if isinstance(value, dict):
+            return value
+    except json.JSONDecodeError:
+        pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        value = json.loads(text[start:end + 1])
+        if isinstance(value, dict):
+            return value
+    raise ValueError("Model did not return a valid JSON object")
+
+
+def call_llm_json(*, prompt: str, config: dict, temperature: float,
+                  max_tokens: int = 900) -> tuple[dict, str] | None:
+    """Call configured providers in order and return the first valid JSON object."""
+    if not config.get("ai", {}).get("enabled", True):
+        return None
+
+    _load_env()
+    attempted = False
+
+    for provider in _provider_order(config):
+        if not _provider_ready(provider):
+            continue
+        attempted = True
+        try:
+            client, model = _client_for(provider)
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Return only valid JSON. Do not use markdown fences or add commentary outside the JSON object.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            content = response.choices[0].message.content or ""
+            data = _extract_json(content)
+            return data, provider
+        except Exception as exc:
+            print(f"[llm-fallback] {provider} failed: {exc}")
+
+    if not attempted:
+        print("[llm] No provider API key configured.")
+    return None
 
 
 def qualify_lead(*, company: str, website: str, signal_name: str, signal_score: int,
                  evidence_url: str, evidence_text: str, research_text: str,
                  config: dict) -> AgentResult | None:
-    client, model = _client_and_model(config)
-    if client is None:
-        return None
-
     offer = config.get("offer", {})
     target = config.get("target", {})
     prompt = f"""
@@ -71,7 +184,7 @@ You are a strict B2B prospect qualification analyst.
 Goal: decide whether this business has OBSERVABLE evidence of a problem that the offer can plausibly solve.
 Do not infer a pain merely because the company belongs to a target industry.
 Do not invent facts, people, revenue, tools, call volume, or operational problems.
-If evidence is weak/ambiguous, mark qualified=false.
+If evidence is weak or ambiguous, set qualified=false.
 
 OFFER
 Name: {offer.get('name', '')}
@@ -95,48 +208,41 @@ Scoring rubric:
 70-84: strong recent/direct need signal
 85-100: unusually explicit buying/need signal
 
-Return:
-- qualified: only true if contacting them is justified by evidence
-- score: 0-100
-- confidence: confidence in the evidence, not confidence that they will buy
-- pain_summary: one factual sentence, no hype
-- reason: concise explanation tying evidence to the offer
-- evidence_quote: the shortest useful exact fragment from supplied evidence; empty if none
+Return exactly this JSON shape:
+{{
+  "qualified": true,
+  "score": 0,
+  "confidence": 0,
+  "pain_summary": "one factual sentence",
+  "reason": "concise evidence-based explanation",
+  "evidence_quote": "shortest useful exact fragment or empty string"
+}}
 """
 
-    try:
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=QualificationResult,
-                temperature=0.1,
-            ),
-        )
-        parsed = response.parsed
-        if not parsed:
-            return None
-        return AgentResult(
-            qualified=bool(parsed.qualified),
-            score=int(parsed.score),
-            confidence=int(parsed.confidence),
-            pain_summary=parsed.pain_summary.strip(),
-            reason=parsed.reason.strip(),
-            evidence_quote=parsed.evidence_quote.strip(),
-        )
-    except Exception as exc:
-        print(f"[ai-qualification-error] {company}: {exc}")
+    raw = call_llm_json(prompt=prompt, config=config, temperature=0.1, max_tokens=700)
+    if not raw:
         return None
+
+    data, provider = raw
+    try:
+        parsed = QualificationResult.model_validate(data)
+    except ValidationError as exc:
+        print(f"[ai-qualification-error] {company}: invalid {provider} response: {exc}")
+        return None
+
+    return AgentResult(
+        qualified=parsed.qualified,
+        score=parsed.score,
+        confidence=parsed.confidence,
+        pain_summary=parsed.pain_summary.strip(),
+        reason=parsed.reason.strip(),
+        evidence_quote=parsed.evidence_quote.strip(),
+    )
 
 
 def write_email(*, company: str, signal_name: str, evidence_text: str,
                 pain_summary: str, ai_reason: str, contact_name: str = "",
                 contact_title: str = "", config: dict) -> tuple[str, str] | None:
-    client, model = _client_and_model(config)
-    if client is None:
-        return None
-
     offer = config.get("offer", {})
     max_words = int(config.get("ai", {}).get("max_email_words", 90))
     greeting = f"Hi {contact_name.split()[0]}," if contact_name.strip() else "Hi,"
@@ -148,7 +254,7 @@ Rules:
 - Do not invent or exaggerate facts.
 - Never pretend you personally experienced their service.
 - Do not use fake compliments.
-- Do not say "I noticed" unless the supplied evidence actually supports the statement.
+- Do not say "I noticed" unless the supplied evidence actually supports it.
 - Lead with the specific business signal/problem, not with the sender.
 - Connect that signal to the offer in plain English.
 - No buzzwords, em dashes, hype, or fake urgency.
@@ -156,7 +262,7 @@ Rules:
 - Keep the BODY under {max_words} words, excluding signature/opt-out.
 - Do not add an opt-out sentence; the sending layer handles it.
 - Subject should be 2-6 words and not clickbait.
-- Address the named contact only if one is supplied below. Never invent a name.
+- Address the named contact only if one is supplied. Never invent a name.
 
 PROSPECT
 Company: {company}
@@ -173,28 +279,27 @@ What it does: {offer.get('description', '')}
 CTA preference: {offer.get('cta', 'Open to a quick chat?')}
 Sender name: {offer.get('sender_name', '')}
 
-Write as a competent operator, not a marketing copywriter.
-Return subject and body. The body must begin exactly with "{greeting}" and end with the sender name.
+The body must begin exactly with "{greeting}" and end with the sender name.
+Return exactly:
+{{
+  "subject": "short subject",
+  "body": "complete plain-text email"
+}}
 """
 
-    try:
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=EmailResult,
-                temperature=0.35,
-            ),
-        )
-        parsed = response.parsed
-        if not parsed:
-            return None
-        subject = parsed.subject.strip().replace("\n", " ")[:120]
-        body = parsed.body.strip()
-        if not subject or not body:
-            return None
-        return subject, body
-    except Exception as exc:
-        print(f"[ai-email-error] {company}: {exc}")
+    raw = call_llm_json(prompt=prompt, config=config, temperature=0.35, max_tokens=650)
+    if not raw:
         return None
+
+    data, provider = raw
+    try:
+        parsed = EmailResult.model_validate(data)
+    except ValidationError as exc:
+        print(f"[ai-email-error] {company}: invalid {provider} response: {exc}")
+        return None
+
+    subject = parsed.subject.strip().replace("\n", " ")[:120]
+    body = parsed.body.strip()
+    if not subject or not body:
+        return None
+    return subject, body
