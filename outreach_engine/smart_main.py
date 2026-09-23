@@ -25,6 +25,7 @@ EXTRA_COLUMNS = {
     "contact_source_url": "TEXT",
     "contact_source_text": "TEXT",
     "contact_confidence": "INTEGER DEFAULT 0",
+    "contact_direct_match": "INTEGER DEFAULT 0",
     "email_mx_valid": "INTEGER DEFAULT 0",
 }
 
@@ -40,7 +41,7 @@ def ensure_extra_columns(conn: sqlite3.Connection) -> None:
 def smart_research(candidate: core.Candidate, config: dict) -> tuple[core.Candidate, str]:
     crawler = config.get("crawler", {})
     timeout = int(crawler.get("timeout_seconds", 12))
-    max_pages = int(crawler.get("max_pages_per_domain", 5))
+    max_pages = int(crawler.get("max_pages_per_domain", 7))
     ua = crawler.get("user_agent", "Mozilla/5.0")
     pages = ["/", "/contact", "/contact-us", "/about", "/team", "/leadership", "/careers", "/jobs"][:max_pages]
     texts: list[str] = []
@@ -96,6 +97,7 @@ def save_enrichment(conn: sqlite3.Connection, candidate: core.Candidate, researc
             "contact_source_url": contact.source_url,
             "contact_source_text": contact.source_text,
             "contact_confidence": contact.confidence,
+            "contact_direct_match": 1 if contact.direct_match else 0,
             "email_mx_valid": 1 if contact.mx_valid else 0,
         })
 
@@ -136,7 +138,11 @@ def discover(conn: sqlite3.Connection, config: dict) -> None:
         )
         if contact:
             candidate.email = contact.email
-            who = f"{contact.name} ({contact.title})" if contact.name else "business inbox"
+            if contact.name:
+                link = "direct" if contact.direct_match else "business inbox"
+                who = f"{contact.name} ({contact.title}) via {link}"
+            else:
+                who = "business inbox"
             print(f"[contact] {candidate.company}: {who} <{contact.email}> conf={contact.confidence} MX={contact.mx_valid}")
         elif require_email:
             print(f"[contact-reject] {candidate.company}: no sufficiently supported public business email")
@@ -184,6 +190,9 @@ def discover(conn: sqlite3.Connection, config: dict) -> None:
 
 def personalized_email(row: sqlite3.Row, config: dict) -> tuple[str, str]:
     result = None
+    direct_name = row["contact_name"] if row["contact_direct_match"] else ""
+    direct_title = row["contact_title"] if row["contact_direct_match"] else ""
+
     if ai_available(config):
         result = write_email(
             company=row["company"],
@@ -191,8 +200,8 @@ def personalized_email(row: sqlite3.Row, config: dict) -> tuple[str, str]:
             evidence_text=row["evidence_text"] or "",
             pain_summary=row["pain_summary"] or "",
             ai_reason=row["ai_reason"] or "",
-            contact_name=row["contact_name"] or "",
-            contact_title=row["contact_title"] or "",
+            contact_name=direct_name or "",
+            contact_title=direct_title or "",
             config=config,
         )
 
@@ -200,8 +209,8 @@ def personalized_email(row: sqlite3.Row, config: dict) -> tuple[str, str]:
         subject, body = result
     else:
         subject, body = core.deterministic_email(row, config)
-        if row["contact_name"]:
-            first = row["contact_name"].split()[0]
+        if direct_name:
+            first = direct_name.split()[0]
             body = body.replace("Hi,", f"Hi {first},", 1)
 
     if config.get("outreach", {}).get("include_opt_out", True):
@@ -262,7 +271,7 @@ def outreach(conn: sqlite3.Connection, config: dict) -> None:
         )
         conn.commit()
         count += 1
-        target = row["contact_name"] or row["email"]
+        target = row["contact_name"] if row["contact_direct_match"] else row["email"]
         print(f"[{status}] {row['company']} -> {target} <{row['email']}> score={row['score']}")
         time.sleep(0.4)
 
@@ -278,9 +287,11 @@ def stats(conn: sqlite3.Connection) -> None:
         print(f"  {row['status']}: {row['n']}")
     ai_count = conn.execute("SELECT COUNT(*) FROM leads WHERE ai_reason IS NOT NULL AND ai_reason != ''").fetchone()[0]
     named_count = conn.execute("SELECT COUNT(*) FROM leads WHERE contact_name IS NOT NULL AND contact_name != ''").fetchone()[0]
+    direct_count = conn.execute("SELECT COUNT(*) FROM leads WHERE contact_direct_match=1").fetchone()[0]
     mx_count = conn.execute("SELECT COUNT(*) FROM leads WHERE email_mx_valid=1").fetchone()[0]
     print(f"AI-qualified: {ai_count}")
-    print(f"Named decision-makers: {named_count}")
+    print(f"Named decision-makers found: {named_count}")
+    print(f"Direct name-email matches: {direct_count}")
     print(f"MX-valid emails: {mx_count}")
 
 
