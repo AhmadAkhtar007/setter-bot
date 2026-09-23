@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
+
+ROOT = Path(__file__).resolve().parent
 
 
 class QualificationResult(BaseModel):
@@ -34,7 +37,7 @@ class AgentResult:
 
 
 def _client_and_model(config: dict):
-    load_dotenv()
+    load_dotenv(ROOT / ".env")
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
         return None, None
@@ -134,7 +137,6 @@ def write_email(*, company: str, signal_name: str, evidence_text: str,
         return None
 
     offer = config.get("offer", {})
-    outreach = config.get("outreach", {})
     max_words = int(config.get("ai", {}).get("max_email_words", 90))
 
     prompt = f"""
