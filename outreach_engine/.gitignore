@@ -1,0 +1,7 @@
+.env
+config.yaml
+credentials.json
+token.json
+leads.db
+__pycache__/
+.venv/
