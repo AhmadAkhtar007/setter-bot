@@ -29,6 +29,12 @@ qualification:
   min_score: 50
   require_public_email: true
 
+contact_intelligence:
+  enabled: true
+  max_search_results: 6
+  min_confidence: 45
+  # The engine only selects emails observed publicly. It does not fabricate firstname@domain guesses.
+
 ai:
   enabled: true
   model: gemini-3.5-flash-lite
@@ -44,5 +50,5 @@ outreach:
 
 crawler:
   timeout_seconds: 12
-  max_pages_per_domain: 5
+  max_pages_per_domain: 7
   user_agent: "Mozilla/5.0 (compatible; OutreachResearchBot/1.0)"
