@@ -4,6 +4,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Type
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -98,9 +99,7 @@ def _client_for(name: str) -> tuple[OpenAI, str]:
     }
 
     if name == "openrouter":
-        headers = {
-            "X-Title": os.getenv("OPENROUTER_APP_NAME", "Outreach Engine"),
-        }
+        headers = {"X-Title": os.getenv("OPENROUTER_APP_NAME", "Outreach Engine")}
         app_url = os.getenv("OPENROUTER_APP_URL", "").strip()
         if app_url:
             headers["HTTP-Referer"] = app_url
@@ -136,8 +135,8 @@ def _extract_json(text: str) -> dict:
 
 
 def call_llm_json(*, prompt: str, config: dict, temperature: float,
-                  max_tokens: int = 900) -> tuple[dict, str] | None:
-    """Call configured providers in order and return the first valid JSON object."""
+                  schema: Type[BaseModel], max_tokens: int = 900) -> tuple[BaseModel, str] | None:
+    """Try providers in order. A provider only succeeds after JSON + schema validation."""
     if not config.get("ai", {}).get("enabled", True):
         return None
 
@@ -164,7 +163,10 @@ def call_llm_json(*, prompt: str, config: dict, temperature: float,
             )
             content = response.choices[0].message.content or ""
             data = _extract_json(content)
-            return data, provider
+            parsed = schema.model_validate(data)
+            return parsed, provider
+        except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+            print(f"[llm-fallback] {provider} returned invalid structured output: {exc}")
         except Exception as exc:
             print(f"[llm-fallback] {provider} failed: {exc}")
 
@@ -219,17 +221,17 @@ Return exactly this JSON shape:
 }}
 """
 
-    raw = call_llm_json(prompt=prompt, config=config, temperature=0.1, max_tokens=700)
+    raw = call_llm_json(
+        prompt=prompt,
+        config=config,
+        temperature=0.1,
+        max_tokens=700,
+        schema=QualificationResult,
+    )
     if not raw:
         return None
 
-    data, provider = raw
-    try:
-        parsed = QualificationResult.model_validate(data)
-    except ValidationError as exc:
-        print(f"[ai-qualification-error] {company}: invalid {provider} response: {exc}")
-        return None
-
+    parsed, _provider = raw
     return AgentResult(
         qualified=parsed.qualified,
         score=parsed.score,
@@ -287,17 +289,17 @@ Return exactly:
 }}
 """
 
-    raw = call_llm_json(prompt=prompt, config=config, temperature=0.35, max_tokens=650)
+    raw = call_llm_json(
+        prompt=prompt,
+        config=config,
+        temperature=0.35,
+        max_tokens=650,
+        schema=EmailResult,
+    )
     if not raw:
         return None
 
-    data, provider = raw
-    try:
-        parsed = EmailResult.model_validate(data)
-    except ValidationError as exc:
-        print(f"[ai-email-error] {company}: invalid {provider} response: {exc}")
-        return None
-
+    parsed, _provider = raw
     subject = parsed.subject.strip().replace("\n", " ")[:120]
     body = parsed.body.strip()
     if not subject or not body:
