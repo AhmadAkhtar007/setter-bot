@@ -52,6 +52,7 @@ class ContactCandidate:
     source_text: str = ""
     confidence: int = 0
     mx_valid: bool = False
+    direct_match: bool = False
 
 
 def _root_domain(website: str) -> str:
@@ -59,8 +60,7 @@ def _root_domain(website: str) -> str:
 
 
 def _normalize_role(role: str) -> str:
-    role = re.sub(r"\s+", " ", (role or "").strip().lower())
-    return role
+    return re.sub(r"\s+", " ", (role or "").strip().lower())
 
 
 def _role_score(role: str) -> int:
@@ -77,7 +77,7 @@ def _name_tokens(name: str) -> list[str]:
 
 def _email_matches_name(email: str, name: str) -> bool:
     local = email.split("@", 1)[0].lower()
-    tokens = [t for t in _name_tokens(name) if len(t) >= 2]
+    tokens = [t for t in _name_tokens(name) if len(t) >= 3]
     if not tokens:
         return False
     return any(t in local for t in tokens)
@@ -121,7 +121,7 @@ def _search_public_evidence(company: str, website: str, max_results: int = 8) ->
         f'"{company}" "managing partner"',
         f'"{company}" "office manager"',
         f'"{company}" contact email',
-        f'site:{domain} owner OR founder OR CEO',
+        f'site:{domain} owner founder CEO',
         f'site:{domain} contact email',
     ]
     results: list[dict] = []
@@ -146,28 +146,43 @@ def _search_public_evidence(company: str, website: str, max_results: int = 8) ->
     return results
 
 
-def _score_email(email: str, name: str, title: str, website: str, mx_ok: bool) -> int:
+def _acceptable_email_domain(email: str, website: str) -> bool:
+    domain = email.rsplit("@", 1)[1].lower()
+    root = _root_domain(website)
+    return domain == root or domain.endswith("." + root) or domain in core.COMMON_FREE_EMAILS
+
+
+def _score_email(email: str, name: str, title: str, website: str, mx_ok: bool) -> tuple[int, bool]:
     domain = email.rsplit("@", 1)[1].lower()
     root = _root_domain(website)
     local = email.split("@", 1)[0].lower()
     score = 0
+    direct_match = _email_matches_name(email, name)
 
     if domain == root or domain.endswith("." + root):
-        score += 35
+        score += 40
+    elif domain in core.COMMON_FREE_EMAILS:
+        score += 8
     if mx_ok:
         score += 15
-    if _email_matches_name(email, name):
-        score += 25
+    if direct_match:
+        score += 28
     if any(local == p or local.startswith(p + ".") or local.startswith(p + "-") for p in ROLE_EMAIL_PREFIXES):
-        score += 12
-    score += min(13, _role_score(title) // 8)
-    return min(100, score)
+        score += 10
+    score += min(7, _role_score(title) // 14)
+    return min(100, score), direct_match
 
 
 def find_best_contact(*, company: str, website: str, research_text: str,
                       existing_email: str | None = None, config: dict | None = None) -> ContactCandidate | None:
     config = config or {}
     contact_cfg = config.get("contact_intelligence", {})
+    if not contact_cfg.get("enabled", True):
+        if existing_email:
+            mx_ok = _mx_valid(existing_email)
+            return ContactCandidate(email=existing_email, confidence=50 if mx_ok else 35, mx_valid=mx_ok)
+        return None
+
     max_results = int(contact_cfg.get("max_search_results", 6))
     min_confidence = int(contact_cfg.get("min_confidence", 45))
 
@@ -178,26 +193,26 @@ def find_best_contact(*, company: str, website: str, research_text: str,
 
     people: list[tuple[str, str, str, str]] = []
     emails: set[str] = set()
-    if existing_email:
+    if existing_email and _acceptable_email_domain(existing_email, website):
         emails.add(existing_email.lower())
 
     for source_url, text in combined_sources:
         for email in _public_emails(text, website):
-            emails.add(email.lower())
+            if _acceptable_email_domain(email, website):
+                emails.add(email.lower())
         for name, role in _extract_name_roles(text):
             people.append((name, role, source_url, text[:1000]))
 
     if not emails:
         return None
 
-    # If no named decision-maker was found, still choose the strongest public role inbox.
     if not people:
         best_email = ""
         best_score = -1
         best_mx = False
         for email in sorted(emails):
             mx_ok = _mx_valid(email)
-            score = _score_email(email, "", "", website, mx_ok)
+            score, _ = _score_email(email, "", "", website, mx_ok)
             if score > best_score:
                 best_email, best_score, best_mx = email, score, mx_ok
         if best_score < min_confidence:
@@ -205,16 +220,17 @@ def find_best_contact(*, company: str, website: str, research_text: str,
         return ContactCandidate(
             email=best_email,
             source_url=website,
-            source_text="Public business email; named decision-maker not confidently identified.",
+            source_text="Public business email; named decision-maker not confidently linked to this inbox.",
             confidence=best_score,
             mx_valid=best_mx,
+            direct_match=False,
         )
 
     best: ContactCandidate | None = None
     for name, title, source_url, source_text in people:
         for email in emails:
             mx_ok = _mx_valid(email)
-            score = _score_email(email, name, title, website, mx_ok)
+            score, direct_match = _score_email(email, name, title, website, mx_ok)
             candidate = ContactCandidate(
                 name=name,
                 title=title,
@@ -223,6 +239,7 @@ def find_best_contact(*, company: str, website: str, research_text: str,
                 source_text=source_text,
                 confidence=score,
                 mx_valid=mx_ok,
+                direct_match=direct_match,
             )
             if best is None or candidate.confidence > best.confidence:
                 best = candidate
