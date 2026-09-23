@@ -33,11 +33,11 @@ contact_intelligence:
   enabled: true
   max_search_results: 6
   min_confidence: 45
-  # The engine only selects emails observed publicly. It does not fabricate firstname@domain guesses.
+  # Only publicly observed emails are selected. No fabricated firstname@domain guesses.
 
 ai:
   enabled: true
-  model: gemini-3.5-flash-lite
+  provider_order: ["nvidia", "openrouter", "gemini"]
   min_heuristic_score_before_ai: 15
   min_confidence: 55
   max_email_words: 90
