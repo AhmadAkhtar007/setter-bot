@@ -1,19 +1,35 @@
 # Outreach Engine
 
-Intent-first prospecting engine for finding businesses with visible buying signals, researching them, AI-qualifying the evidence, and creating personalized Gmail drafts or sending qualified outreach.
+Intent-first prospecting engine for finding businesses with visible buying signals, researching them, identifying the best public contact, AI-qualifying the evidence, and creating personalized Gmail drafts or sending qualified outreach.
 
 ## Pipeline
 
 ```text
 Web signal search
     -> business website research
-    -> public contact discovery
+    -> decision-maker/contact intelligence
+    -> public email + MX validation
     -> Gemini qualification
     -> pain + evidence score
     -> personalized email
     -> Gmail draft (default)
     -> optional send
 ```
+
+## What the contact intelligence agent does
+
+For each candidate business it:
+
+- searches public web evidence for owners, founders, CEOs, partners, principals and managers
+- scans the company's public website for names, titles and business emails
+- keeps only publicly observed emails; it does not fabricate `firstname@company.com` guesses
+- prefers the prospect's own domain over unrelated third-party addresses
+- checks whether the email domain has MX records
+- ranks named contacts and role inboxes by confidence
+- records the contact source URL and evidence
+- distinguishes a true name-email match from a generic company inbox
+
+If the engine finds a decision-maker name but cannot directly link that name to the email address, it may still use the public business inbox, but it will **not** write a named greeting such as `Hi John,` to `info@company.com`.
 
 ## What the AI agent does
 
@@ -32,10 +48,11 @@ The prompt explicitly forbids invented pain, fake compliments, fake personal exp
 
 ## Files
 
-- `main.py` - original deterministic crawler/Gmail core
+- `main.py` - deterministic crawler/Gmail core
+- `contact_agent.py` - public decision-maker/contact discovery + MX validation
 - `ai_agent.py` - Gemini qualification + email-writing agent
-- `smart_main.py` - recommended entrypoint; connects AI to discovery and outreach
-- `config.example.yaml` - offer, ICP, signal, qualification and volume settings
+- `smart_main.py` - recommended entrypoint; connects contact intelligence, AI and Gmail
+- `config.example.yaml` - offer, ICP, signal, qualification, contact and volume settings
 - `.env.example` - API/OAuth environment variables
 - `leads.db` - generated SQLite lead/evidence database
 
@@ -43,13 +60,14 @@ The prompt explicitly forbids invented pain, fake compliments, fake personal exp
 
 Default stack:
 
-- DDGS for search discovery
+- DDGS for public search discovery
 - `httpx` + BeautifulSoup for direct public-page research
+- `dnspython` for email-domain MX checks
 - Gemini API for qualification/personalization when a key is configured
 - Gmail API for draft/send
 - SQLite for local storage
 
-There is no required paid lead database or enrichment provider in v1. This also means the engine only uses contact details it can find publicly and cannot guarantee a direct verified decision-maker email for every company.
+There is no required paid lead database or enrichment provider in v1. That keeps the stack cheap, but coverage is intentionally lower than paid enrichment systems: if a trustworthy public contact cannot be found, the lead is skipped.
 
 ## Safe defaults
 
@@ -57,10 +75,12 @@ There is no required paid lead database or enrichment provider in v1. This also 
 - daily cap: 25
 - AI minimum qualification score: 50
 - AI minimum evidence confidence: 55%
+- contact confidence threshold: 45
 - duplicate suppression
 - opt-out footer
-- no outreach when no public email is available
-- evidence stored with every qualified lead
+- no outreach when no sufficiently supported public email is available
+- named greeting only for direct name-email matches
+- evidence and contact source stored with every qualified lead
 
 ## Setup
 
@@ -98,13 +118,13 @@ Do not commit `credentials.json`, `token.json`, `.env`, or `leads.db`.
 
 ## Run
 
-### 1. Find + research + qualify leads
+### 1. Find + research + contact-enrich + qualify leads
 
 ```powershell
 python smart_main.py --discover
 ```
 
-The engine searches configured signals, crawls each candidate business, rejects weak leads and stores qualified prospects in SQLite.
+The engine searches configured signals, researches each business, finds the strongest public contact, rejects weak leads and stores qualified prospects in SQLite.
 
 ### 2. Create personalized Gmail drafts
 
@@ -119,6 +139,8 @@ Default configuration creates Gmail drafts only.
 ```powershell
 python smart_main.py --stats
 ```
+
+Stats now include AI-qualified leads, named decision-makers found, direct name-email matches and MX-valid emails.
 
 ### Run the full pipeline
 
